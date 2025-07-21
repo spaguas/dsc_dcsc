@@ -21,7 +21,6 @@ cycler==0.12.1
 dask==2023.5.0
 eccodes==2.39.2
 findlibs==0.0.5
-Fiona==1.8.21
 fonttools==4.56.0
 frozenlist==1.5.0
 fsspec==2025.2.0

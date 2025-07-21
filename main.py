@@ -18,24 +18,65 @@ from rasterio.transform import from_origin
 from dotenv import load_dotenv
 import os
 import json
-import psycopg2
+import psycopg2 as pg
 import os
 import tempfile
+import logging
 
 load_dotenv()
 
-conn = psycopg2.connect(
-    dbname=os.environ.get('DATABASE_NAME'), 
-    user=os.environ.get('DATABASE_USER'), 
-    password=os.environ.get('DATABASE_PASSWORD'), 
-    host=os.environ.get('DATABASE_HOST'), 
-    port=os.environ.get('DATABASE_PORT')
+logging.basicConfig(
+    filename="log_grib_download.log",
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
 )
-conn.autocommit = False
-cursor = conn.cursor()
 
-DF_CITIES = {}
-PARAMETERS = {}
+# conn = pg.connect(
+#     dbname=os.environ.get('DATABASE_NAME'), 
+#     user=os.environ.get('DATABASE_USER'), 
+#     password=os.environ.get('DATABASE_PASSWORD'), 
+#     host=os.environ.get('DATABASE_HOST'), 
+#     port=os.environ.get('DATABASE_PORT')
+# )
+# conn.autocommit = False
+# cursor = conn.cursor()
+
+def conection_postgres():
+    host = os.environ.get('DATABASE_HOST')
+    port = os.environ.get('DATABASE_PORT')
+    user = os.environ.get('DATABASE_USER')
+    password = os.environ.get('DATABASE_PASSWORD')
+    database = os.environ.get('DATABASE_NAME')    
+
+    conn = pg.connect(
+        host=host,
+        database=database,
+        user=user,
+        password=password
+    )
+    return conn.cursor()
+
+def execute_query(query):
+    cur = conection_postgres()
+    conn = cur.connection
+    try:
+        cur.execute(query)
+        rows = cur.fetchall()
+        
+        colunas = [desc[0] for desc in cur.description]
+        df = pd.DataFrame(rows, columns=colunas)
+
+        return df
+
+    except Exception as e:
+        print(f"Erro ao executar a query: {e}")
+        return None
+
+    finally:
+        if cur:
+            cur.close()
+        if conn:
+            conn.close()
 
 async def download_file(url, filename, semaphore):
     try:
@@ -44,7 +85,6 @@ async def download_file(url, filename, semaphore):
             ssl_context = ssl.create_default_context()
             ssl_context.check_hostname = False
             ssl_context.verify_mode = ssl.CERT_NONE
-
             connector = TCPConnector(ssl=ssl_context)
 
             async with aiohttp.ClientSession(timeout=timeout,connector=connector) as session:
@@ -53,14 +93,16 @@ async def download_file(url, filename, semaphore):
                         with open(filename, "wb") as f:
                             while chunk := await response.content.read(1024 * 1024):
                                 f.write(chunk)
-                        print(f"✅ Download concluído: {filename}")
+                        logging.info(f"✅ Download concluído: {filename}")
+                        return True
                     else:
-                        print(f"⚠️ Erro no download ({response.status}): {url}")
+                        logging.warning(f"⚠️ Erro HTTP {response.status} para URL: {url}")
+                        return False
     except Exception as e:
-        print(f"❌ Erro inesperado em {url}: {e}")
+        logging.exception(f"❌ Erro inesperado ao baixar {url}: {e}")
+        return False
 
 async def baixar_grib_hoje():
-    # 14/05
     hoje = datetime.now() - timedelta(days=1)
     # hoje = datetime.now()
     ano, mes, dia = hoje.year, hoje.month, hoje.day 
@@ -71,26 +113,27 @@ async def baixar_grib_hoje():
     # Baixar somente se não existir
     # if not os.path.exists(filename):
     semaphore = asyncio.Semaphore(1)
-    await download_file(url, filename, semaphore)
-    # else:
-        # print("📂 Arquivo já existe localmente.")
+    sucesso = await download_file(url, filename, semaphore)
+
+    if not sucesso:
+            logging.error(f"❌ Falha no download do GRIB para {hoje.strftime('%Y-%m-%d')}")
+            return None, hoje
 
     return filename, hoje
 
+
+
 def getCities():
-    cursor.execute(f"SELECT * FROM cities where id != 2")
+    query = f"SELECT * FROM cities where id != 2"
+    df_cities = execute_query(query)
 
-    results = cursor.fetchall()
+    return df_cities
 
-    return pd.DataFrame.from_records(results, columns=[col[0] for col in cursor.description])
+def getparameters():
+    query = f"SELECT * FROM parameters where parameter_type_id = 5"
+    df_parameters = execute_query(query)
 
-def getParameters():
-    cursor.execute(f"SELECT * FROM parameters where parameter_type_id = 5")
-
-    results = cursor.fetchall()
-
-    return pd.DataFrame.from_records(results, columns=[col[0] for col in cursor.description])
-
+    return df_parameters
 
 
 def saveParameter(city_id, dsc):
@@ -99,9 +142,10 @@ def saveParameter(city_id, dsc):
         values = (parameters.values::jsonb || excluded.values::jsonb)::json,
         updated_at = now()
     """
-    
-    cursor.execute(sql)
+    cur = conection_postgres()
+    cur.execute(sql)
 
+    conn = cur.connection
     conn.commit()
     
 def createFile(ds):
@@ -188,7 +232,8 @@ def calculateZonal(ds):
     resultados = []
 
     data = pd.to_datetime(str(ds.time.values)).date() if "time" in ds.coords else None
-
+    print(ds)
+    print(ds.data_vars)
     array = ds.prec.values.astype(np.float32)
 
     for idx, row in municipios_sp.iterrows():
@@ -223,19 +268,21 @@ def saveHidroData(id, rain_today, date):
             updated_at = now()
             RETURNING model_id, dsc
         """
-        
-        cursor.execute(sql)
-        result = cursor.fetchone()
-        
+        cur = conection_postgres()
+        cur.execute(sql)
+
+        result = cur.fetchone()
+        conn = cur.connection
         # conn.commit()
 
 
 def main():
+    
     pd.set_option('display.max_rows', None)
     print('buscando cidades SIBH')
-    DF_CITIES = getCities()
+    df_cities = getCities()
     print('buscando parametros SIBH')
-    PARAMETERS = getParameters()
+    parameters = getparameters()
 
     print('baixando raster de chuva')
     filename_hoje, data_hoje = asyncio.run(baixar_grib_hoje())
@@ -250,8 +297,6 @@ def main():
 
     resultados = calculateZonal(ds)
 
-    # Depois você pode excluir esse arquivo manualmente se quiser
-
     # Converter para DataFrame
     df_prec_max = pd.DataFrame(resultados)
 
@@ -261,13 +306,13 @@ def main():
     ontem = datetime.now() - timedelta(days=2)
     ano_o, mes_o, dia_o = ontem.year, ontem.month, ontem.day
 
-    city_ids = DF_CITIES['id'].unique()
+    city_ids = df_cities['id'].unique()
     df_list = []
 
     for id in city_ids:
-        city = DF_CITIES[DF_CITIES['id'] == id].iloc[0]
+        city = df_cities[df_cities['id'] == id].iloc[0]
 
-        parameter = PARAMETERS[PARAMETERS['parameterizable_id'] == id]
+        parameter = parameters[parameters['parameterizable_id'] == id]
 
         if(len(parameter) > 0):
             parameter = parameter.iloc[0]
@@ -311,17 +356,17 @@ def main():
     print(df_atualizado)
     # ibge = cds[0]
     # print(first)
-    for ibge in cds:
-        dsc = df_dias_secos_new[df_dias_secos_new['cd_mun'] == ibge].iloc[0]['DSC']
-        rain_today = df_dias_secos_new[df_dias_secos_new['cd_mun'] == ibge].iloc[0]['rain_today']
-        id = DF_CITIES[DF_CITIES['cod_ibge'] == ibge].iloc[0]['id']
-        print(ibge)
+    # for ibge in cds:
+    #     dsc = df_dias_secos_new[df_dias_secos_new['cd_mun'] == ibge].iloc[0]['DSC']
+    #     rain_today = df_dias_secos_new[df_dias_secos_new['cd_mun'] == ibge].iloc[0]['rain_today']
+    #     id = df_cities[df_cities['cod_ibge'] == ibge].iloc[0]['id']
+    #     print(ibge)
         
-        # print(f'salvando {ibge} {id} {dsc}')
-        print('salvando parametro de dias sem chuva consecutivos')
-        saveParameter(id, dsc)
-        print('salvando parametro de dias sem chuva no mes 05')
-        saveHidroData(id, rain_today, '2025-07-01 03:00')
+    #     # print(f'salvando {ibge} {id} {dsc}')
+    #     print('salvando parametro de dias sem chuva consecutivos')
+    #     saveParameter(id, dsc)
+    #     print('salvando parametro de dias sem chuva no mes 05')
+    #     saveHidroData(id, rain_today, '2025-07-01 03:00')
 
 
         # df_dias_secos_new.to_csv(f'ds_dsc{ano}{mes:02}{dia:02}.csv', index=False)
