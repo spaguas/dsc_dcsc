@@ -35,6 +35,14 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s"
 )
 
+db_logger = logging.getLogger("database")
+db_handler = logging.FileHandler("log_database_save.log")
+db_handler.setFormatter(
+    logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+)
+db_logger.addHandler(db_handler)
+db_logger.setLevel(logging.INFO)
+
 # conn = pg.connect(
 #     dbname=os.environ.get('DATABASE_NAME'), 
 #     user=os.environ.get('DATABASE_USER'), 
@@ -267,6 +275,27 @@ def calculateZonal(ds):
 
     return resultados
 
+
+def verificar_salvamento_hoje():
+    arquivo_log = "log_database_save.log"
+
+    if not os.path.exists(arquivo_log):
+        return False
+
+    hoje = datetime.now().strftime("%Y-%m-%d")
+
+    with open(arquivo_log, "r", encoding="cp1252") as f:
+        linhas = f.readlines()
+
+    for linha in reversed(linhas):
+        if "Salvamentos finalizados com sucesso" in linha:
+            data_log = linha[:10]
+
+            return data_log == hoje
+
+    return False
+
+
 def saveHidroData(id, rain_today, date):
     # print(id,rain_today)
     if(rain_today == 0):
@@ -346,109 +375,125 @@ def save_parameters_batch(rows):
 
 def main():
     pd.set_option('display.max_rows', None)
-    print('buscando cidades SIBH')
-    df_cities = getCities()
 
-    hoje = datetime.now() - timedelta(days=1)
-    ano_ref, mes_ref, dia = hoje.year, hoje.month, hoje.day
+    if verificar_salvamento_hoje():
+        print("Salvamento de hoje já foi realizado.")
+    else:
+        print("Salvamento de hoje não encontrado. Executando...")
+        print('buscando cidades SIBH')
+        df_cities = getCities()
 
+        hoje = datetime.now() - timedelta(days=1)
+        ano_ref, mes_ref, dia = hoje.year, hoje.month, hoje.day
 
-    """Trecho comentado para permitir a execução retroatica em lote em datas futuras, caso necessário. Todo o restantante do código deve ficar dentro do for dia in range(1, ultimo_dia + 1):""" 
-    # ano_ref = 2026
-    # mes_ref = 6
-    # dias_no_mes = calendar.monthrange(ano_ref, mes_ref)[1]
+        """Trecho comentado para permitir a execução retroativa em lote em datas futuras, caso necessário. 
+        Todo o restantante do código deve ficar dentro do for dia in range(1, ultimo_dia + 1):""" 
+        #=================================================================================================
+        # ano_ref = 2026
+        # mes_ref = 6
+        # dias_no_mes = calendar.monthrange(ano_ref, mes_ref)[1]
 
-    # hoje = datetime.now()
+        # hoje = datetime.now()
 
-    # # último dia disponível: ontem, e nunca além do fim do mês
-    # if ano_ref == hoje.year and mes_ref == hoje.month:
-    #     ultimo_dia = (hoje - timedelta(days=1)).day
-    # else:
-    #     ultimo_dia = dias_no_mes
+        # # último dia disponível: ontem, e nunca além do fim do mês
+        # if ano_ref == hoje.year and mes_ref == hoje.month:
+        #     ultimo_dia = (hoje - timedelta(days=1)).day
+        # else:
+        #     ultimo_dia = dias_no_mes
 
-    # for dia in range(1, ultimo_dia + 1):
+        # for dia in range(1, ultimo_dia + 1):
         
-    parameters = getparameters()
-    print(f'baixando raster de chuva para {dia}-{mes_ref}-{ano_ref}')
-    filename_hoje, data_hoje = asyncio.run(baixar_grib_hoje(ano_ref, mes_ref, dia))
-    print('download finalizado com sucesso')
-    ds =  xr.open_dataset(filename_hoje)
+            
+        parameters = getparameters()
+        print(f'baixando raster de chuva para {dia}-{mes_ref}-{ano_ref}')
+        filename_hoje, data_hoje = asyncio.run(baixar_grib_hoje(ano_ref, mes_ref, dia))
+        print('download finalizado com sucesso')
+        ds =  xr.open_dataset(filename_hoje)
 
-    # Define resolução (assume 0.1° que é típico no MERGE, ajuste se necessário)
+        # Define resolução (assume 0.1° que é típico no MERGE, ajuste se necessário)
+        # resultados = createFile(ds)
 
-    # resultados = createFile(ds)
+        try:
+            createFileAux(ds)
+            resultados = calculateZonal(ds)
+        finally:
+            ds.close()
 
-    try:
-        createFileAux(ds)
-        resultados = calculateZonal(ds)
-    finally:
-        ds.close()
+        df_prec_max = pd.DataFrame(resultados)
 
-    # Converter para DataFrame
-    df_prec_max = pd.DataFrame(resultados)
+        hoje = datetime.now() - timedelta(days=1)
+        ano, mes, dia = hoje.year, hoje.month, hoje.day
 
-    hoje = datetime.now() - timedelta(days=1)
-    ano, mes, dia = hoje.year, hoje.month, hoje.day
+        ontem = datetime.now() - timedelta(days=2)
+        ano_o, mes_o, dia_o = ontem.year, ontem.month, ontem.day
 
-    ontem = datetime.now() - timedelta(days=2)
-    ano_o, mes_o, dia_o = ontem.year, ontem.month, ontem.day
+        city_ids = df_cities['id'].unique()
+        df_list = []
 
-    city_ids = df_cities['id'].unique()
-    df_list = []
+        for id in city_ids:
+            city = df_cities[df_cities['id'] == id].iloc[0]
 
-    for id in city_ids:
-        city = df_cities[df_cities['id'] == id].iloc[0]
+            parameter = parameters[parameters['parameterizable_id'] == id]
 
-        parameter = parameters[parameters['parameterizable_id'] == id]
+            if(len(parameter) > 0):
+                parameter = parameter.iloc[0]
+            
+                dsc = parameter['values']['climate']['dsc']
+                df_list.append({'cd_mun': city['cod_ibge'], 'DSC': dsc })
+            
+        df_dias_secos = pd.DataFrame(df_list)
+        # df_dias_secos = pd.read_csv(f'ds_dsc{ano_o}{mes_o:02}{dia_o:02}.csv')
+        # df_dias_secos["cd_mun"] = df_dias_secos["cd_mun"].astype(str)
 
-        if(len(parameter) > 0):
-            parameter = parameter.iloc[0]
+        df_prec_max["cd_mun"] = df_prec_max["cd_mun"].astype(str)
+        df_atualizado = pd.merge(df_dias_secos, df_prec_max[['cd_mun', 'prec_max']], on='cd_mun', how='left')
+
+        # print(df_atualizado)
+
+        def atualizar_dias_secos(row):
+            if row['prec_max'] < 1:
+                # row['DS'] += 1
+                row['DSC'] += 1
+                row['rain_today'] = 0
+            else:
+                # DS mantém, DSC zera
+                row['DSC'] = 0
+                row['rain_today'] = 1
+            return row
+
+        # Aplicar função linha a linha
+        df_atualizado = df_atualizado.apply(atualizar_dias_secos, axis=1)
+        # df_atualizado['DSC'] = 0 #Para o caso de zerar novamente
+
+        # Atualizar o DataFrame original
+        df_dias_secos_new = df_atualizado[['cd_mun',  'DSC', 'rain_today']].copy()
+
+        cds = df_dias_secos_new['cd_mun'].unique()
+
+        df_merged = df_dias_secos_new.merge(df_cities[['cod_ibge', 'id']], left_on='cd_mun', right_on='cod_ibge')
+
+        rows_consec = list(zip(df_merged['id'], df_merged['DSC']))
+        rows_today = list(zip(df_merged['id'], df_merged['rain_today']))
+        # print(rows_today)
+
+        print(f'salvando parametro de dias sem chuva no mes {mes_ref}')
+        db_logger.info(f"Salvando parâmetro de dias sem chuva no mês {mes_ref}")
+        # save_hidrodata_batch(rows_today, f'{ano_ref}-{mes_ref:02}-{dia:02} 03:00')
+        try:
+            save_hidrodata_batch(rows_today, f'{ano_ref}-{mes_ref:02}-{dia:02} 03:00')
+        except Exception as e:
+            db_logger.error(f"Erro ao salvar hidrodata: {e}")
         
-            dsc = parameter['values']['climate']['dsc']
-            df_list.append({'cd_mun': city['cod_ibge'], 'DSC': dsc })
+        print('salvando parametro de dias sem chuva consecutivos')
+        db_logger.info("Salvando parâmetro de dias sem chuva consecutivos")
+        # save_parameters_batch(rows_consec)
+        try:
+            save_parameters_batch(rows_consec)
+        except Exception as e:
+            db_logger.error(f"Erro ao salvar parameters: {e}")
         
-    df_dias_secos = pd.DataFrame(df_list)
 
-    # df_dias_secos = pd.read_csv(f'ds_dsc{ano_o}{mes_o:02}{dia_o:02}.csv')
-
-    # df_dias_secos["cd_mun"] = df_dias_secos["cd_mun"].astype(str)
-    df_prec_max["cd_mun"] = df_prec_max["cd_mun"].astype(str)
-    df_atualizado = pd.merge(df_dias_secos, df_prec_max[['cd_mun', 'prec_max']], on='cd_mun', how='left')
-
-    # print(df_atualizado)
-
-    # Aplicar as regras para atualização
-    def atualizar_dias_secos(row):
-        if row['prec_max'] < 1:
-            # row['DS'] += 1
-            row['DSC'] += 1
-            row['rain_today'] = 0
-        else:
-            # DS mantém, DSC zera
-            row['DSC'] = 0
-            row['rain_today'] = 1
-        return row
-
-    # Aplicar função linha a linha
-    df_atualizado = df_atualizado.apply(atualizar_dias_secos, axis=1)
-    # df_atualizado['DSC'] = 0
-
-    # Atualizar o DataFrame original
-    df_dias_secos_new = df_atualizado[['cd_mun',  'DSC', 'rain_today']].copy()
-
-    cds = df_dias_secos_new['cd_mun'].unique()
-
-    df_merged = df_dias_secos_new.merge(df_cities[['cod_ibge', 'id']], left_on='cd_mun', right_on='cod_ibge')
-
-    rows_consec = list(zip(df_merged['id'], df_merged['DSC']))
-    rows_today = list(zip(df_merged['id'], df_merged['rain_today']))
-    # print(rows_today)
-
-    print('salvando parametro de dias sem chuva no mes 05')
-    save_hidrodata_batch(rows_today, f'{ano_ref}-{mes_ref:02}-{dia:02} 03:00')
-    
-    print('salvando parametro de dias sem chuva consecutivos')
-    save_parameters_batch(rows_consec)
+        db_logger.info("Salvamentos finalizados com sucesso")
         
         # print(df_atualizado)
 
