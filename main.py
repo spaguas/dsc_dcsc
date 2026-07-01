@@ -22,6 +22,10 @@ import psycopg2 as pg
 import os
 import tempfile
 import logging
+from psycopg2.extras import execute_values
+import calendar
+
+"""Rodar a partir das 15h, a imagem sai às 13h"""
 
 load_dotenv()
 
@@ -102,10 +106,12 @@ async def download_file(url, filename, semaphore):
         logging.exception(f"❌ Erro inesperado ao baixar {url}: {e}")
         return False
 
-async def baixar_grib_hoje():
+async def baixar_grib_hoje(ano, mes, dia):
     hoje = datetime.now() - timedelta(days=1)
-    # hoje = datetime.now()
-    ano, mes, dia = hoje.year, hoje.month, hoje.day 
+    # # hoje = datetime.now()
+    # ano, mes, dia = hoje.year, hoje.month, hoje.day 
+
+
     url = f"http://ftp.cptec.inpe.br/modelos/tempo/MERGE/GPM/DAILY/{ano}/{mes:02}/MERGE_CPTEC_{ano}{mes:02}{dia:02}.grib2"
     filename = 'grib_dia.grib2'
 
@@ -118,6 +124,7 @@ async def baixar_grib_hoje():
     if not sucesso:
             logging.error(f"❌ Falha no download do GRIB para {hoje.strftime('%Y-%m-%d')}")
             return None, hoje
+
 
     return filename, hoje
 
@@ -232,9 +239,10 @@ def calculateZonal(ds):
     resultados = []
 
     data = pd.to_datetime(str(ds.time.values)).date() if "time" in ds.coords else None
-    print(ds)
-    print(ds.data_vars)
-    array = ds.prec.values.astype(np.float32)
+    # print(ds)
+    # print(ds.data_vars)
+    # array = ds.prec.values.astype(np.float32)
+    array = ds.rdp.values.astype(np.float32)
 
     for idx, row in municipios_sp.iterrows():
         # Estatística zonal
@@ -268,24 +276,101 @@ def saveHidroData(id, rain_today, date):
             updated_at = now()
             RETURNING model_id, dsc
         """
-        cur = conection_postgres()
-        cur.execute(sql)
 
-        result = cur.fetchone()
-        conn = cur.connection
+        print(sql)
+        # cur = conection_postgres()
+        # cur.execute(sql)
+
+        # result = cur.fetchone()
+        # conn = cur.connection
         # conn.commit()
 
+def save_hidrodata_batch(rows, date):
+    """
+    rows: lista de tuplas (city_id, rain_today)
+    Só insere/atualiza onde rain_today == 0
+    """
+    filtered = [(city_id,) for city_id, rain_today in rows if rain_today == 0]
+
+    if not filtered:
+        return []
+
+    sql = """
+        INSERT INTO hidroapp_statistics
+            (model_type, model_id, date_hour, dsc, created_at, updated_at)
+        VALUES %s
+        ON CONFLICT (model_type, model_id, date_hour)
+        DO UPDATE SET
+            dsc = COALESCE(hidroapp_statistics.dsc, 0) + 1,
+            updated_at = now()
+        RETURNING model_id, dsc
+    """
+
+    template = f"('City', %s, '{date}', 1, now(), now())"
+
+    cur = conection_postgres()
+    conn = cur.connection
+
+    execute_values(cur, sql, filtered, template=template, fetch=True)
+
+    conn.commit()
+    cur.close()
+  
+
+def save_parameters_batch(rows):
+    """
+    rows: lista de tuplas (city_id, dsc)
+    """
+    sql = """
+        INSERT INTO parameters
+            (name, parameterizable_type, parameterizable_id, values, created_at, updated_at, parameter_type_id)
+        VALUES %s
+        ON CONFLICT (parameterizable_type, parameterizable_id, parameter_type_id)
+        DO UPDATE SET
+            values = (parameters.values::jsonb || excluded.values::jsonb)::json,
+            updated_at = now()
+    """
+
+    template = "('NewCityParameter', 'City', %s, %s, now(), now(), 5)"
+    values = [
+        (city_id, json.dumps({"climate": {"dsc": dsc}}))
+        for city_id, dsc in rows
+    ]
+
+
+    cur = conection_postgres()
+    conn = cur.connection
+    execute_values(cur, sql, values, template=template)
+    conn.commit()
+    cur.close()
 
 def main():
-    
     pd.set_option('display.max_rows', None)
     print('buscando cidades SIBH')
     df_cities = getCities()
-    print('buscando parametros SIBH')
-    parameters = getparameters()
 
-    print('baixando raster de chuva')
-    filename_hoje, data_hoje = asyncio.run(baixar_grib_hoje())
+    hoje = datetime.now() - timedelta(days=1)
+    ano_ref, mes_ref, dia = hoje.year, hoje.month, hoje.day
+
+
+    """Trecho comentado para permitir a execução retroatica em lote em datas futuras, caso necessário. Todo o restantante do código deve ficar dentro do for dia in range(1, ultimo_dia + 1):""" 
+    # ano_ref = 2026
+    # mes_ref = 6
+    # dias_no_mes = calendar.monthrange(ano_ref, mes_ref)[1]
+
+    # hoje = datetime.now()
+
+    # # último dia disponível: ontem, e nunca além do fim do mês
+    # if ano_ref == hoje.year and mes_ref == hoje.month:
+    #     ultimo_dia = (hoje - timedelta(days=1)).day
+    # else:
+    #     ultimo_dia = dias_no_mes
+
+    # for dia in range(1, ultimo_dia + 1):
+        
+    parameters = getparameters()
+    print(f'baixando raster de chuva para {dia}-{mes_ref}-{ano_ref}')
+    filename_hoje, data_hoje = asyncio.run(baixar_grib_hoje(ano_ref, mes_ref, dia))
     print('download finalizado com sucesso')
     ds =  xr.open_dataset(filename_hoje)
 
@@ -293,9 +378,11 @@ def main():
 
     # resultados = createFile(ds)
 
-    createFileAux(ds)
-
-    resultados = calculateZonal(ds)
+    try:
+        createFileAux(ds)
+        resultados = calculateZonal(ds)
+    finally:
+        ds.close()
 
     # Converter para DataFrame
     df_prec_max = pd.DataFrame(resultados)
@@ -322,9 +409,7 @@ def main():
         
     df_dias_secos = pd.DataFrame(df_list)
 
-
     # df_dias_secos = pd.read_csv(f'ds_dsc{ano_o}{mes_o:02}{dia_o:02}.csv')
-
 
     # df_dias_secos["cd_mun"] = df_dias_secos["cd_mun"].astype(str)
     df_prec_max["cd_mun"] = df_prec_max["cd_mun"].astype(str)
@@ -346,30 +431,41 @@ def main():
 
     # Aplicar função linha a linha
     df_atualizado = df_atualizado.apply(atualizar_dias_secos, axis=1)
+    # df_atualizado['DSC'] = 0
 
     # Atualizar o DataFrame original
     df_dias_secos_new = df_atualizado[['cd_mun',  'DSC', 'rain_today']].copy()
 
     cds = df_dias_secos_new['cd_mun'].unique()
 
+    df_merged = df_dias_secos_new.merge(df_cities[['cod_ibge', 'id']], left_on='cd_mun', right_on='cod_ibge')
 
-    print(df_atualizado)
-    # ibge = cds[0]
-    # print(first)
-    # for ibge in cds:
-    #     dsc = df_dias_secos_new[df_dias_secos_new['cd_mun'] == ibge].iloc[0]['DSC']
-    #     rain_today = df_dias_secos_new[df_dias_secos_new['cd_mun'] == ibge].iloc[0]['rain_today']
-    #     id = df_cities[df_cities['cod_ibge'] == ibge].iloc[0]['id']
-    #     print(ibge)
+    rows_consec = list(zip(df_merged['id'], df_merged['DSC']))
+    rows_today = list(zip(df_merged['id'], df_merged['rain_today']))
+    # print(rows_today)
+
+    print('salvando parametro de dias sem chuva no mes 05')
+    save_hidrodata_batch(rows_today, f'{ano_ref}-{mes_ref:02}-{dia:02} 03:00')
+    
+    print('salvando parametro de dias sem chuva consecutivos')
+    save_parameters_batch(rows_consec)
         
-    #     # print(f'salvando {ibge} {id} {dsc}')
-    #     print('salvando parametro de dias sem chuva consecutivos')
-    #     saveParameter(id, dsc)
-    #     print('salvando parametro de dias sem chuva no mes 05')
-    #     saveHidroData(id, rain_today, '2025-07-01 03:00')
+        # print(df_atualizado)
+
+        # for ibge in cds:
+        #     dsc = df_dias_secos_new[df_dias_secos_new['cd_mun'] == ibge].iloc[0]['DSC']
+        #     rain_today = df_dias_secos_new[df_dias_secos_new['cd_mun'] == ibge].iloc[0]['rain_today']
+        #     id = df_cities[df_cities['cod_ibge'] == ibge].iloc[0]['id']
+        #     print(ibge)
+            
+        #     # print(f'salvando {ibge} {id} {dsc}')
+        #     # print('salvando parametro de dias sem chuva consecutivos')
+        #     # saveParameter(id, dsc)
+        #     print('salvando parametro de dias sem chuva no mes 04')
+        #     saveHidroData(id, rain_today, '2026-04-01 03:00')
 
 
-        # df_dias_secos_new.to_csv(f'ds_dsc{ano}{mes:02}{dia:02}.csv', index=False)
+            # df_dias_secos_new.to_csv(f'ds_dsc{ano}{mes:02}{dia:02}.csv', index=False)
 
 main()
 
