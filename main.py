@@ -306,7 +306,6 @@ def saveHidroData(id, rain_today, date):
             RETURNING model_id, dsc
         """
 
-        print(sql)
         # cur = conection_postgres()
         # cur.execute(sql)
 
@@ -390,7 +389,7 @@ def main():
         Todo o restantante do código deve ficar dentro do for dia in range(1, ultimo_dia + 1):""" 
         #=================================================================================================
         # ano_ref = 2026
-        # mes_ref = 6
+        # mes_ref = 7
         # dias_no_mes = calendar.monthrange(ano_ref, mes_ref)[1]
 
         # hoje = datetime.now()
@@ -401,9 +400,8 @@ def main():
         # else:
         #     ultimo_dia = dias_no_mes
 
-        # for dia in range(1, ultimo_dia + 1):
-        
-            
+        # for dia in range(2, ultimo_dia + 1):
+           
         parameters = getparameters()
         print(f'baixando raster de chuva para {dia}-{mes_ref}-{ano_ref}')
         filename_hoje, data_hoje = asyncio.run(baixar_grib_hoje(ano_ref, mes_ref, dia))
@@ -474,7 +472,6 @@ def main():
 
         rows_consec = list(zip(df_merged['id'], df_merged['DSC']))
         rows_today = list(zip(df_merged['id'], df_merged['rain_today']))
-        # print(rows_today)
 
         print(f'salvando parametro de dias sem chuva no mes {mes_ref}')
         db_logger.info(f"Salvando parâmetro de dias sem chuva no mês {mes_ref}")
@@ -495,7 +492,6 @@ def main():
 
         db_logger.info("Salvamentos finalizados com sucesso")
         
-        # print(df_atualizado)
 
         # for ibge in cds:
         #     dsc = df_dias_secos_new[df_dias_secos_new['cd_mun'] == ibge].iloc[0]['DSC']
@@ -510,7 +506,7 @@ def main():
         #     saveHidroData(id, rain_today, '2026-04-01 03:00')
 
 
-            # df_dias_secos_new.to_csv(f'ds_dsc{ano}{mes:02}{dia:02}.csv', index=False)
+        # df_dias_secos_new.to_csv(f'ds_dsc{ano}{mes:02}{dia:02}.csv', index=False)
 
 main()
 
